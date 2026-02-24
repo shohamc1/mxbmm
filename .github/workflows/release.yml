@@ -1,0 +1,84 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: mxbmm-linux-x86_64
+            binary_path: target/release/mxbmm
+            archive_ext: tar.gz
+          - os: macos-latest
+            artifact_name: mxbmm-macos-x86_64
+            binary_path: target/release/mxbmm
+            archive_ext: tar.gz
+          - os: windows-latest
+            artifact_name: mxbmm-windows-x86_64
+            binary_path: target/release/mxbmm.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.binary_path }}" dist/mxbmm
+          tar -czf "${{ matrix.artifact_name }}.${{ matrix.archive_ext }}" -C dist mxbmm
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "${{ matrix.binary_path }}" "dist/mxbmm.exe"
+          Compress-Archive -Path dist/mxbmm.exe -DestinationPath "${{ matrix.artifact_name }}.${{ matrix.archive_ext }}" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/mxbmm-linux-x86_64/mxbmm-linux-x86_64.tar.gz
+            release-assets/mxbmm-macos-x86_64/mxbmm-macos-x86_64.tar.gz
+            release-assets/mxbmm-windows-x86_64/mxbmm-windows-x86_64.zip
