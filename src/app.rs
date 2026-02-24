@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -16,19 +17,7 @@ use crate::model::{
 pub struct MxbmmApp {
     mods_root_input: String,
     status: Option<StatusMessage>,
-    tracks: Vec<ModEntry>,
-    bikes_motocross: Vec<ModEntry>,
-    bikes_supercross: Vec<ModEntry>,
-    bikes_paints: Vec<ModEntry>,
-    tyres: Vec<ModEntry>,
-    rider_models: Vec<ModEntry>,
-    rider_paints: Vec<ModEntry>,
-    rider_gloves: Vec<ModEntry>,
-    rider_helmets: Vec<ModEntry>,
-    rider_helmet_paints: Vec<ModEntry>,
-    rider_boots: Vec<ModEntry>,
-    rider_boot_paints: Vec<ModEntry>,
-    rider_protections: Vec<ModEntry>,
+    mod_lists: HashMap<InstallTarget, Vec<ModEntry>>,
     pending_install: Option<PendingInstall>,
     pending_uninstall: Option<ModEntry>,
     fs_watcher: Option<FsWatcherState>,
@@ -41,19 +30,7 @@ impl Default for MxbmmApp {
         let mut app = Self {
             mods_root_input: mods_root.to_string_lossy().to_string(),
             status: None,
-            tracks: Vec::new(),
-            bikes_motocross: Vec::new(),
-            bikes_supercross: Vec::new(),
-            bikes_paints: Vec::new(),
-            tyres: Vec::new(),
-            rider_models: Vec::new(),
-            rider_paints: Vec::new(),
-            rider_gloves: Vec::new(),
-            rider_helmets: Vec::new(),
-            rider_helmet_paints: Vec::new(),
-            rider_boots: Vec::new(),
-            rider_boot_paints: Vec::new(),
-            rider_protections: Vec::new(),
+            mod_lists: HashMap::new(),
             pending_install: None,
             pending_uninstall: None,
             fs_watcher: None,
@@ -62,6 +39,14 @@ impl Default for MxbmmApp {
         app.refresh_mod_lists();
         app.sync_fs_watcher();
         app
+    }
+}
+
+impl Drop for MxbmmApp {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending_install.take() {
+            pending.source.cleanup();
+        }
     }
 }
 
@@ -82,29 +67,11 @@ impl MxbmmApp {
     }
 
     fn refresh_mod_lists(&mut self) {
-        self.tracks = read_mod_entries(&self.target_dir(InstallTarget::Tracks), &[]);
-        self.bikes_motocross =
-            read_mod_entries(&self.target_dir(InstallTarget::BikesMotocross), &[]);
-        self.bikes_supercross =
-            read_mod_entries(&self.target_dir(InstallTarget::BikesSupercross), &[]);
-        self.bikes_paints = read_mod_entries(&self.target_dir(InstallTarget::BikesPaints), &[]);
-        self.tyres = read_mod_entries(&self.target_dir(InstallTarget::Tyres), &[]);
-        self.rider_models = read_mod_entries(
-            &self.target_dir(InstallTarget::RiderModels),
-            &["paints", "gloves"],
-        );
-        self.rider_paints = read_mod_entries(&self.target_dir(InstallTarget::RiderPaints), &[]);
-        self.rider_gloves = read_mod_entries(&self.target_dir(InstallTarget::RiderGloves), &[]);
-        self.rider_helmets =
-            read_mod_entries(&self.target_dir(InstallTarget::RiderHelmets), &["paints"]);
-        self.rider_helmet_paints =
-            read_mod_entries(&self.target_dir(InstallTarget::RiderHelmetPaints), &[]);
-        self.rider_boots =
-            read_mod_entries(&self.target_dir(InstallTarget::RiderBoots), &["paints"]);
-        self.rider_boot_paints =
-            read_mod_entries(&self.target_dir(InstallTarget::RiderBootPaints), &[]);
-        self.rider_protections =
-            read_mod_entries(&self.target_dir(InstallTarget::RiderProtections), &[]);
+        for &target in &ALL_INSTALL_TARGETS {
+            let entries =
+                read_mod_entries(&self.target_dir(target), target.excluded_subdirs());
+            self.mod_lists.insert(target, entries);
+        }
     }
 
     fn sync_fs_watcher(&mut self) {
@@ -193,7 +160,12 @@ impl MxbmmApp {
 
         let file_path = files[0].clone();
         if is_pkz_file(&file_path) {
-            match self.prepare_pending_pkz_install(file_path.clone()) {
+            match self.prepare_pending_single_file_install(
+                file_path.clone(),
+                InstallTarget::Tracks,
+                "track",
+                |p| PendingSource::Pkz { pkz_path: p },
+            ) {
                 Ok(pending) => {
                     self.pending_install = Some(pending);
                     self.set_status(
@@ -219,7 +191,12 @@ impl MxbmmApp {
         }
 
         if is_pnt_file(&file_path) {
-            match self.prepare_pending_pnt_install(file_path.clone()) {
+            match self.prepare_pending_single_file_install(
+                file_path.clone(),
+                InstallTarget::RiderPaints,
+                "rider",
+                |p| PendingSource::Pnt { pnt_path: p },
+            ) {
                 Ok(pending) => {
                     self.pending_install = Some(pending);
                     self.set_status(
@@ -252,7 +229,7 @@ impl MxbmmApp {
             return;
         }
 
-        match self.prepare_pending_install(file_path.clone()) {
+        match self.prepare_pending_zip_install(file_path.clone()) {
             Ok(pending) => {
                 self.pending_install = Some(pending);
                 self.set_status(
@@ -272,7 +249,10 @@ impl MxbmmApp {
         }
     }
 
-    fn prepare_pending_install(&self, archive_path: PathBuf) -> Result<PendingInstall, String> {
+    fn prepare_pending_zip_install(
+        &self,
+        archive_path: PathBuf,
+    ) -> Result<PendingInstall, String> {
         let temp_extract_dir = create_temp_extract_dir().map_err(|e| e.to_string())?;
         if let Err(err) = extract_zip_archive(&archive_path, &temp_extract_dir) {
             let _ = fs::remove_dir_all(&temp_extract_dir);
@@ -292,40 +272,26 @@ impl MxbmmApp {
         })
     }
 
-    fn prepare_pending_pkz_install(&self, pkz_path: PathBuf) -> Result<PendingInstall, String> {
-        if !pkz_path.exists() {
+    fn prepare_pending_single_file_install(
+        &self,
+        path: PathBuf,
+        default_target: InstallTarget,
+        fallback_name: &str,
+        make_source: impl FnOnce(PathBuf) -> PendingSource,
+    ) -> Result<PendingInstall, String> {
+        if !path.exists() {
             return Err("File does not exist.".to_string());
         }
 
-        let default_name = pkz_path
+        let default_name = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("track")
+            .unwrap_or(fallback_name)
             .to_string();
 
         Ok(PendingInstall {
-            source: PendingSource::Pkz { pkz_path },
-            install_target: InstallTarget::Tracks,
-            custom_name: default_name,
-            notes: String::new(),
-            version: String::new(),
-        })
-    }
-
-    fn prepare_pending_pnt_install(&self, pnt_path: PathBuf) -> Result<PendingInstall, String> {
-        if !pnt_path.exists() {
-            return Err("File does not exist.".to_string());
-        }
-
-        let default_name = pnt_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("rider")
-            .to_string();
-
-        Ok(PendingInstall {
-            source: PendingSource::Pnt { pnt_path },
-            install_target: InstallTarget::RiderPaints,
+            source: make_source(path),
+            install_target: default_target,
             custom_name: default_name,
             notes: String::new(),
             version: String::new(),
@@ -359,134 +325,106 @@ impl MxbmmApp {
             return;
         }
 
-        match pending.source.clone() {
+        let result: Result<(StatusKind, String), String> = match &pending.source {
             PendingSource::Zip {
                 archive_path,
                 temp_extract_dir,
             } => {
                 let destination = base_destination.join(&install_name);
                 if destination.exists() {
-                    self.set_status(
-                        StatusKind::Error,
-                        format!(
-                            "Destination already exists: {}. Choose another install name.",
-                            destination.display()
-                        ),
-                    );
-                    self.pending_install = Some(pending);
-                    return;
-                }
-
-                if let Err(err) = fs::create_dir_all(&destination) {
-                    self.set_status(
-                        StatusKind::Error,
-                        format!(
-                            "Failed to create install folder {}: {}",
-                            destination.display(),
-                            err
-                        ),
-                    );
-                    self.pending_install = Some(pending);
-                    return;
-                }
-
-                let source_root = pick_source_root(&temp_extract_dir);
-                if let Err(err) = copy_dir_contents(&source_root, &destination) {
-                    let _ = fs::remove_dir_all(&destination);
-                    self.set_status(
-                        StatusKind::Error,
-                        format!("Install failed while copying files: {}", err),
-                    );
-                    self.pending_install = Some(pending);
-                    return;
-                }
-
-                if let Err(err) = write_metadata_file(
-                    &destination,
-                    pending.install_target,
-                    &pending.version,
-                    &pending.notes,
-                    &archive_path,
-                ) {
-                    self.set_status(
-                        StatusKind::Info,
-                        format!(
-                            "Installed, but failed to write metadata file in {}: {}",
-                            destination.display(),
-                            err
-                        ),
-                    );
+                    Err(format!(
+                        "Destination already exists: {}. Choose another install name.",
+                        destination.display()
+                    ))
+                } else if let Err(err) = fs::create_dir_all(&destination) {
+                    Err(format!(
+                        "Failed to create install folder {}: {}",
+                        destination.display(),
+                        err
+                    ))
                 } else {
-                    self.set_status(
-                        StatusKind::Success,
-                        format!("Installed mod to {}", destination.display()),
-                    );
+                    let source_root = pick_source_root(temp_extract_dir);
+                    if let Err(err) = copy_dir_contents(&source_root, &destination) {
+                        let _ = fs::remove_dir_all(&destination);
+                        Err(format!("Install failed while copying files: {}", err))
+                    } else if let Err(err) = write_metadata_file(
+                        &destination,
+                        pending.install_target,
+                        &pending.version,
+                        &pending.notes,
+                        archive_path,
+                    ) {
+                        Ok((
+                            StatusKind::Info,
+                            format!(
+                                "Installed, but failed to write metadata file in {}: {}",
+                                destination.display(),
+                                err
+                            ),
+                        ))
+                    } else {
+                        Ok((
+                            StatusKind::Success,
+                            format!("Installed mod to {}", destination.display()),
+                        ))
+                    }
                 }
             }
             PendingSource::Pkz { pkz_path } => {
                 let file_name = with_extension_if_missing(&install_name, ".pkz");
                 let destination = base_destination.join(file_name);
                 if destination.exists() {
-                    self.set_status(
-                        StatusKind::Error,
-                        format!("Destination already exists: {}.", destination.display()),
-                    );
-                    self.pending_install = Some(pending);
-                    return;
+                    Err(format!(
+                        "Destination already exists: {}.",
+                        destination.display()
+                    ))
+                } else if let Err(err) = fs::copy(pkz_path, &destination) {
+                    Err(format!(
+                        "Failed to install .pkz file to {}: {}",
+                        destination.display(),
+                        err
+                    ))
+                } else {
+                    Ok((
+                        StatusKind::Success,
+                        format!("Installed mod file to {}", destination.display()),
+                    ))
                 }
-
-                if let Err(err) = fs::copy(pkz_path, &destination) {
-                    self.set_status(
-                        StatusKind::Error,
-                        format!(
-                            "Failed to install .pkz file to {}: {}",
-                            destination.display(),
-                            err
-                        ),
-                    );
-                    self.pending_install = Some(pending);
-                    return;
-                }
-
-                self.set_status(
-                    StatusKind::Success,
-                    format!("Installed mod file to {}", destination.display()),
-                );
             }
             PendingSource::Pnt { pnt_path } => {
                 let file_name = with_extension_if_missing(&install_name, ".pnt");
                 let destination = base_destination.join(file_name);
                 if destination.exists() {
-                    self.set_status(
-                        StatusKind::Error,
-                        format!("Destination already exists: {}.", destination.display()),
-                    );
-                    self.pending_install = Some(pending);
-                    return;
+                    Err(format!(
+                        "Destination already exists: {}.",
+                        destination.display()
+                    ))
+                } else if let Err(err) = fs::copy(pnt_path, &destination) {
+                    Err(format!(
+                        "Failed to install .pnt file to {}: {}",
+                        destination.display(),
+                        err
+                    ))
+                } else {
+                    Ok((
+                        StatusKind::Success,
+                        format!("Installed mod file to {}", destination.display()),
+                    ))
                 }
+            }
+        };
 
-                if let Err(err) = fs::copy(pnt_path, &destination) {
-                    self.set_status(
-                        StatusKind::Error,
-                        format!(
-                            "Failed to install .pnt file to {}: {}",
-                            destination.display(),
-                            err
-                        ),
-                    );
-                    self.pending_install = Some(pending);
-                    return;
-                }
-
-                self.set_status(
-                    StatusKind::Success,
-                    format!("Installed mod file to {}", destination.display()),
-                );
+        match result {
+            Ok((kind, msg)) => {
+                self.set_status(kind, msg);
+                pending.source.cleanup();
+                self.refresh_mod_lists();
+            }
+            Err(msg) => {
+                self.set_status(StatusKind::Error, msg);
+                self.pending_install = Some(pending);
             }
         }
-
-        pending.source.cleanup();
-        self.refresh_mod_lists();
     }
 
     fn uninstall_mod(&mut self, entry: &ModEntry) {
@@ -578,7 +516,12 @@ impl MxbmmApp {
         }
     }
 
-    fn draw_mod_list(ui: &mut egui::Ui, title: &str, mods: &[ModEntry]) -> Option<ModEntry> {
+    fn draw_mod_list(
+        ui: &mut egui::Ui,
+        title: &str,
+        mods: &[ModEntry],
+        interactive: bool,
+    ) -> Option<ModEntry> {
         let mut uninstall_target = None;
         egui::CollapsingHeader::new(format!("{title} ({})", mods.len()))
             .default_open(false)
@@ -595,7 +538,7 @@ impl MxbmmApp {
                         for entry in mods {
                             ui.horizontal(|ui| {
                                 ui.label(&entry.name);
-                                if ui.button("Uninstall").clicked() {
+                                if interactive && ui.button("Uninstall").clicked() {
                                     uninstall_target = Some(entry.clone());
                                 }
                             });
@@ -611,6 +554,8 @@ impl eframe::App for MxbmmApp {
         self.sync_fs_watcher();
         self.process_fs_events();
         self.handle_dropped_files(ctx);
+
+        let has_pending_uninstall = self.pending_uninstall.is_some();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("MX Bikes Mod Manager");
@@ -640,48 +585,26 @@ impl eframe::App for MxbmmApp {
 
             ui.separator();
             ui.heading("Installed Mods");
-            let uninstall_target = egui::ScrollArea::vertical()
-                .show(ui, |ui| {
-                    None.or(Self::draw_mod_list(ui, "Tracks", &self.tracks))
-                        .or(Self::draw_mod_list(
-                            ui,
-                            "Bikes (Motocross)",
-                            &self.bikes_motocross,
-                        ))
-                        .or(Self::draw_mod_list(
-                            ui,
-                            "Bikes (Supercross)",
-                            &self.bikes_supercross,
-                        ))
-                        .or(Self::draw_mod_list(ui, "Bike Paints", &self.bikes_paints))
-                        .or(Self::draw_mod_list(ui, "Tyres/Wheels", &self.tyres))
-                        .or(Self::draw_mod_list(ui, "Rider Models", &self.rider_models))
-                        .or(Self::draw_mod_list(ui, "Rider Paints", &self.rider_paints))
-                        .or(Self::draw_mod_list(ui, "Rider Gloves", &self.rider_gloves))
-                        .or(Self::draw_mod_list(
-                            ui,
-                            "Helmet Models",
-                            &self.rider_helmets,
-                        ))
-                        .or(Self::draw_mod_list(
-                            ui,
-                            "Helmet Paints",
-                            &self.rider_helmet_paints,
-                        ))
-                        .or(Self::draw_mod_list(ui, "Boot Models", &self.rider_boots))
-                        .or(Self::draw_mod_list(
-                            ui,
-                            "Boot Paints",
-                            &self.rider_boot_paints,
-                        ))
-                        .or(Self::draw_mod_list(
-                            ui,
-                            "Protections",
-                            &self.rider_protections,
-                        ))
-                })
-                .inner;
-            self.pending_uninstall = uninstall_target.or(self.pending_uninstall.clone());
+
+            let mut uninstall_target = None;
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for &target in &ALL_INSTALL_TARGETS {
+                    let mods = self
+                        .mod_lists
+                        .get(&target)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    if let Some(entry) =
+                        Self::draw_mod_list(ui, target.label(), mods, !has_pending_uninstall)
+                    {
+                        uninstall_target = Some(entry);
+                    }
+                }
+            });
+
+            if !has_pending_uninstall {
+                self.pending_uninstall = uninstall_target;
+            }
         });
 
         if let Some(target) = self.pending_uninstall.clone() {

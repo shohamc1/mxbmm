@@ -4,7 +4,7 @@ use std::sync::mpsc::Receiver;
 
 use notify::RecommendedWatcher;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InstallTarget {
     Tracks,
     BikesMotocross,
@@ -57,6 +57,14 @@ impl InstallTarget {
             Self::RiderProtections => "rider/protections",
         }
     }
+
+    pub fn excluded_subdirs(self) -> &'static [&'static str] {
+        match self {
+            Self::RiderModels => &["paints", "gloves"],
+            Self::RiderHelmets | Self::RiderBoots => &["paints"],
+            _ => &[],
+        }
+    }
 }
 
 pub const ALL_INSTALL_TARGETS: [InstallTarget; 13] = [
@@ -93,7 +101,6 @@ pub struct StatusMessage {
     pub text: String,
 }
 
-#[derive(Clone)]
 pub enum PendingSource {
     Zip {
         archive_path: PathBuf,
