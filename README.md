@@ -28,27 +28,8 @@ Download prebuilt binaries from GitHub Releases:
 Pick the asset for your OS:
 
 - `mxbmm-windows-x86_64.zip`
-- `mxbmm-macos-x86_64.tar.gz`
+- `mxbmm-macos-x86_64.zip`
 - `mxbmm-linux-x86_64.tar.gz`
-
----
-
-## Run
-
-### Windows
-
-1. Extract `mxbmm-windows-x86_64.zip`
-2. Run `mxbmm.exe`
-
-### macOS
-
-1. Extract `mxbmm-macos-x86_64.tar.gz`
-2. Run `mxbmm`
-
-### Linux
-
-1. Extract `mxbmm-linux-x86_64.tar.gz`
-2. Run `mxbmm`
 
 ---
 
@@ -62,8 +43,13 @@ On startup, MXBMM auto-detects your mods root:
 Examples:
 
 ```bash
-# macOS/Linux
+# Linux
 MXBMM_MODS_ROOT="/custom/path/to/mods" ./mxbmm
+```
+
+```bash
+# macOS (launch bundle executable directly, optional)
+MXBMM_MODS_ROOT="/custom/path/to/mods" ./MXBMM.app/Contents/MacOS/MXBMM
 ```
 
 ```powershell

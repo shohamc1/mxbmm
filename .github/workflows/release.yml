@@ -23,7 +23,7 @@ jobs:
           - os: macos-latest
             artifact_name: mxbmm-macos-x86_64
             binary_path: target/release/mxbmm
-            archive_ext: tar.gz
+            archive_ext: zip
           - os: windows-latest
             artifact_name: mxbmm-windows-x86_64
             binary_path: target/release/mxbmm.exe
@@ -42,13 +42,53 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           mkdir -p dist
           cp "${{ matrix.binary_path }}" dist/mxbmm
           tar -czf "${{ matrix.artifact_name }}.${{ matrix.archive_ext }}" -C dist mxbmm
+
+      - name: Package (macOS app bundle)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP_ROOT="dist/MXBMM.app"
+          mkdir -p "${APP_ROOT}/Contents/MacOS" "${APP_ROOT}/Contents/Resources"
+          cp "${{ matrix.binary_path }}" "${APP_ROOT}/Contents/MacOS/MXBMM"
+          chmod +x "${APP_ROOT}/Contents/MacOS/MXBMM"
+          cat > "${APP_ROOT}/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleDisplayName</key>
+            <string>MXBMM</string>
+            <key>CFBundleExecutable</key>
+            <string>MXBMM</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.shohamc1.mxbmm</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>MXBMM</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ github.ref_name }}</string>
+            <key>CFBundleVersion</key>
+            <string>${{ github.run_number }}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          ditto -c -k --sequesterRsrc --keepParent "${APP_ROOT}" "${{ matrix.artifact_name }}.${{ matrix.archive_ext }}"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -80,5 +120,5 @@ jobs:
         with:
           files: |
             release-assets/mxbmm-linux-x86_64/mxbmm-linux-x86_64.tar.gz
-            release-assets/mxbmm-macos-x86_64/mxbmm-macos-x86_64.tar.gz
+            release-assets/mxbmm-macos-x86_64/mxbmm-macos-x86_64.zip
             release-assets/mxbmm-windows-x86_64/mxbmm-windows-x86_64.zip
