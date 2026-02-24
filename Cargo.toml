@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 dirs = "=5.0.1"
-eframe = { version = "=0.29.1", features = ["wgpu"] }
+eframe = "=0.29.1"
+notify = "=6.1.1"
 walkdir = "=2.5.0"
 zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }

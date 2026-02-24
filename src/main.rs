@@ -1,9 +1,11 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -11,6 +13,7 @@ use zip::ZipArchive;
 enum ModType {
     Track,
     Bike,
+    Rider,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,14 +49,59 @@ struct StatusMessage {
     text: String,
 }
 
+#[derive(Clone)]
+enum PendingSource {
+    Zip {
+        archive_path: PathBuf,
+        temp_extract_dir: PathBuf,
+    },
+    Pkz {
+        pkz_path: PathBuf,
+    },
+    Pnt {
+        pnt_path: PathBuf,
+    },
+}
+
+impl PendingSource {
+    fn input_path(&self) -> &Path {
+        match self {
+            Self::Zip { archive_path, .. } => archive_path,
+            Self::Pkz { pkz_path } => pkz_path,
+            Self::Pnt { pnt_path } => pnt_path,
+        }
+    }
+
+    fn cleanup(&self) {
+        if let Self::Zip {
+            temp_extract_dir, ..
+        } = self
+        {
+            let _ = fs::remove_dir_all(temp_extract_dir);
+        }
+    }
+
+    fn forced_mod_type(&self) -> Option<ModType> {
+        match self {
+            Self::Pnt { .. } => Some(ModType::Rider),
+            _ => None,
+        }
+    }
+}
+
 struct PendingInstall {
-    archive_path: PathBuf,
-    temp_extract_dir: PathBuf,
+    source: PendingSource,
     mod_type: ModType,
     bike_category: BikeCategory,
     custom_name: String,
     notes: String,
     version: String,
+}
+
+struct FsWatcherState {
+    root: PathBuf,
+    _watcher: RecommendedWatcher,
+    rx: Receiver<notify::Result<notify::Event>>,
 }
 
 struct MxbmmApp {
@@ -62,8 +110,11 @@ struct MxbmmApp {
     tracks: Vec<ModEntry>,
     bikes_motocross: Vec<ModEntry>,
     bikes_supercross: Vec<ModEntry>,
+    riders: Vec<ModEntry>,
     pending_install: Option<PendingInstall>,
     pending_uninstall: Option<ModEntry>,
+    fs_watcher: Option<FsWatcherState>,
+    watcher_error_for_root: Option<PathBuf>,
 }
 
 impl Default for MxbmmApp {
@@ -75,10 +126,14 @@ impl Default for MxbmmApp {
             tracks: Vec::new(),
             bikes_motocross: Vec::new(),
             bikes_supercross: Vec::new(),
+            riders: Vec::new(),
             pending_install: None,
             pending_uninstall: None,
+            fs_watcher: None,
+            watcher_error_for_root: None,
         };
         app.refresh_mod_lists();
+        app.sync_fs_watcher();
         app
     }
 }
@@ -107,11 +162,80 @@ impl MxbmmApp {
         self.bikes_dir().join(category.folder_name())
     }
 
+    fn riders_dir(&self) -> PathBuf {
+        self.mods_root().join("rider").join("riders")
+    }
+
     fn refresh_mod_lists(&mut self) {
         self.tracks = read_mod_entries(&self.tracks_dir());
         self.bikes_motocross = read_mod_entries(&self.bikes_category_dir(BikeCategory::Motocross));
         self.bikes_supercross =
             read_mod_entries(&self.bikes_category_dir(BikeCategory::Supercross));
+        self.riders = read_mod_entries(&self.riders_dir());
+    }
+
+    fn sync_fs_watcher(&mut self) {
+        let root = self.mods_root();
+        if self
+            .fs_watcher
+            .as_ref()
+            .map(|w| w.root == root)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.fs_watcher = None;
+        if !root.exists() {
+            return;
+        }
+
+        match create_fs_watcher(&root) {
+            Ok(watcher) => {
+                self.fs_watcher = Some(watcher);
+                self.watcher_error_for_root = None;
+            }
+            Err(err) => {
+                if self.watcher_error_for_root.as_ref() != Some(&root) {
+                    self.set_status(
+                        StatusKind::Info,
+                        format!(
+                            "File watcher unavailable for {}: {}. Use Refresh manually.",
+                            root.display(),
+                            err
+                        ),
+                    );
+                    self.watcher_error_for_root = Some(root);
+                }
+            }
+        }
+    }
+
+    fn process_fs_events(&mut self) {
+        let mut should_refresh = false;
+        let mut event_error: Option<String> = None;
+        if let Some(watcher) = &self.fs_watcher {
+            while let Ok(event_result) = watcher.rx.try_recv() {
+                match event_result {
+                    Ok(_event) => {
+                        should_refresh = true;
+                    }
+                    Err(err) => {
+                        event_error = Some(err.to_string());
+                    }
+                }
+            }
+        }
+
+        if should_refresh {
+            self.refresh_mod_lists();
+        }
+        if let Some(err) = event_error {
+            self.set_status(
+                StatusKind::Info,
+                format!("File watcher event error: {}. Refresh may be needed.", err),
+            );
+        }
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -123,48 +247,93 @@ impl MxbmmApp {
         if self.pending_install.is_some() {
             self.set_status(
                 StatusKind::Info,
-                "Finish or cancel the current pending install before dropping another archive.",
+                "Finish or cancel the current pending install before dropping another file.",
             );
             return;
         }
 
         let files: Vec<PathBuf> = dropped_files.into_iter().filter_map(|f| f.path).collect();
         if files.len() != 1 {
+            self.set_status(StatusKind::Error, "Drop exactly one file at a time.");
+            return;
+        }
+
+        let file_path = files[0].clone();
+        if is_pkz_file(&file_path) {
+            match self.prepare_pending_pkz_install(file_path.clone()) {
+                Ok(pending) => {
+                    self.pending_install = Some(pending);
+                    self.set_status(
+                        StatusKind::Info,
+                        format!(
+                            ".pkz file loaded: {}. Select mod type and install.",
+                            file_path.display()
+                        ),
+                    );
+                }
+                Err(err) => {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!(
+                            "Failed to prepare .pkz file {}: {}",
+                            file_path.display(),
+                            err
+                        ),
+                    );
+                }
+            }
+            return;
+        }
+
+        if is_pnt_file(&file_path) {
+            match self.prepare_pending_pnt_install(file_path.clone()) {
+                Ok(pending) => {
+                    self.pending_install = Some(pending);
+                    self.set_status(
+                        StatusKind::Info,
+                        format!(
+                            ".pnt file loaded: {}. Classified as Rider automatically.",
+                            file_path.display()
+                        ),
+                    );
+                }
+                Err(err) => {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!(
+                            "Failed to prepare .pnt file {}: {}",
+                            file_path.display(),
+                            err
+                        ),
+                    );
+                }
+            }
+            return;
+        }
+
+        if !is_supported_archive(&file_path) {
             self.set_status(
                 StatusKind::Error,
-                "Drop exactly one archive file at a time.",
+                "Unsupported file type. Supported: .zip, .pkz, and .pnt.",
             );
             return;
         }
 
-        let archive_path = files[0].clone();
-        if !is_supported_archive(&archive_path) {
-            self.set_status(
-                StatusKind::Error,
-                "Unsupported archive type. Currently only .zip is supported.",
-            );
-            return;
-        }
-
-        match self.prepare_pending_install(archive_path.clone()) {
+        match self.prepare_pending_install(file_path.clone()) {
             Ok(pending) => {
                 self.pending_install = Some(pending);
                 self.set_status(
                     StatusKind::Info,
                     format!(
                         "Archive extracted: {}. Fill out mod details and install.",
-                        archive_path.display()
+                        file_path.display()
                     ),
                 );
             }
             Err(err) => {
                 self.set_status(
                     StatusKind::Error,
-                    format!(
-                        "Failed to extract archive {}: {}",
-                        archive_path.display(),
-                        err
-                    ),
+                    format!("Failed to extract archive {}: {}", file_path.display(), err),
                 );
             }
         }
@@ -179,9 +348,53 @@ impl MxbmmApp {
 
         let default_name = guess_mod_name(&temp_extract_dir, &archive_path);
         Ok(PendingInstall {
-            archive_path,
-            temp_extract_dir,
+            source: PendingSource::Zip {
+                archive_path,
+                temp_extract_dir,
+            },
             mod_type: ModType::Track,
+            bike_category: BikeCategory::Motocross,
+            custom_name: default_name,
+            notes: String::new(),
+            version: String::new(),
+        })
+    }
+
+    fn prepare_pending_pkz_install(&self, pkz_path: PathBuf) -> Result<PendingInstall, String> {
+        if !pkz_path.exists() {
+            return Err("File does not exist.".to_string());
+        }
+
+        let default_name = pkz_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("track")
+            .to_string();
+
+        Ok(PendingInstall {
+            source: PendingSource::Pkz { pkz_path },
+            mod_type: ModType::Track,
+            bike_category: BikeCategory::Motocross,
+            custom_name: default_name,
+            notes: String::new(),
+            version: String::new(),
+        })
+    }
+
+    fn prepare_pending_pnt_install(&self, pnt_path: PathBuf) -> Result<PendingInstall, String> {
+        if !pnt_path.exists() {
+            return Err("File does not exist.".to_string());
+        }
+
+        let default_name = pnt_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rider")
+            .to_string();
+
+        Ok(PendingInstall {
+            source: PendingSource::Pnt { pnt_path },
+            mod_type: ModType::Rider,
             bike_category: BikeCategory::Motocross,
             custom_name: default_name,
             notes: String::new(),
@@ -201,9 +414,12 @@ impl MxbmmApp {
             return;
         }
 
-        let base_destination = match pending.mod_type {
+        let effective_mod_type = pending.source.forced_mod_type().unwrap_or(pending.mod_type);
+
+        let base_destination = match effective_mod_type {
             ModType::Track => self.tracks_dir(),
             ModType::Bike => self.bikes_category_dir(pending.bike_category),
+            ModType::Rider => self.riders_dir(),
         };
 
         if let Err(err) = fs::create_dir_all(&base_destination) {
@@ -219,67 +435,134 @@ impl MxbmmApp {
             return;
         }
 
-        let destination = base_destination.join(&install_name);
-        if destination.exists() {
-            self.set_status(
-                StatusKind::Error,
-                format!(
-                    "Destination already exists: {}. Choose another install name.",
-                    destination.display()
-                ),
-            );
-            self.pending_install = Some(pending);
-            return;
+        match pending.source.clone() {
+            PendingSource::Zip {
+                archive_path,
+                temp_extract_dir,
+            } => {
+                let destination = base_destination.join(&install_name);
+                if destination.exists() {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!(
+                            "Destination already exists: {}. Choose another install name.",
+                            destination.display()
+                        ),
+                    );
+                    self.pending_install = Some(pending);
+                    return;
+                }
+
+                if let Err(err) = fs::create_dir_all(&destination) {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!(
+                            "Failed to create install folder {}: {}",
+                            destination.display(),
+                            err
+                        ),
+                    );
+                    self.pending_install = Some(pending);
+                    return;
+                }
+
+                let source_root = pick_source_root(&temp_extract_dir);
+                if let Err(err) = copy_dir_contents(&source_root, &destination) {
+                    let _ = fs::remove_dir_all(&destination);
+                    self.set_status(
+                        StatusKind::Error,
+                        format!("Install failed while copying files: {}", err),
+                    );
+                    self.pending_install = Some(pending);
+                    return;
+                }
+
+                if let Err(err) = write_metadata_file(
+                    &destination,
+                    effective_mod_type,
+                    pending.bike_category,
+                    &pending.version,
+                    &pending.notes,
+                    &archive_path,
+                ) {
+                    self.set_status(
+                        StatusKind::Info,
+                        format!(
+                            "Installed, but failed to write metadata file in {}: {}",
+                            destination.display(),
+                            err
+                        ),
+                    );
+                } else {
+                    self.set_status(
+                        StatusKind::Success,
+                        format!("Installed mod to {}", destination.display()),
+                    );
+                }
+            }
+            PendingSource::Pkz { pkz_path } => {
+                let file_name = with_extension_if_missing(&install_name, ".pkz");
+                let destination = base_destination.join(file_name);
+                if destination.exists() {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!("Destination already exists: {}.", destination.display()),
+                    );
+                    self.pending_install = Some(pending);
+                    return;
+                }
+
+                if let Err(err) = fs::copy(pkz_path, &destination) {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!(
+                            "Failed to install .pkz file to {}: {}",
+                            destination.display(),
+                            err
+                        ),
+                    );
+                    self.pending_install = Some(pending);
+                    return;
+                }
+
+                self.set_status(
+                    StatusKind::Success,
+                    format!("Installed mod file to {}", destination.display()),
+                );
+            }
+            PendingSource::Pnt { pnt_path } => {
+                let file_name = with_extension_if_missing(&install_name, ".pnt");
+                let destination = base_destination.join(file_name);
+                if destination.exists() {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!("Destination already exists: {}.", destination.display()),
+                    );
+                    self.pending_install = Some(pending);
+                    return;
+                }
+
+                if let Err(err) = fs::copy(pnt_path, &destination) {
+                    self.set_status(
+                        StatusKind::Error,
+                        format!(
+                            "Failed to install .pnt file to {}: {}",
+                            destination.display(),
+                            err
+                        ),
+                    );
+                    self.pending_install = Some(pending);
+                    return;
+                }
+
+                self.set_status(
+                    StatusKind::Success,
+                    format!("Installed mod file to {}", destination.display()),
+                );
+            }
         }
 
-        if let Err(err) = fs::create_dir_all(&destination) {
-            self.set_status(
-                StatusKind::Error,
-                format!(
-                    "Failed to create install folder {}: {}",
-                    destination.display(),
-                    err
-                ),
-            );
-            self.pending_install = Some(pending);
-            return;
-        }
-
-        let source_root = pick_source_root(&pending.temp_extract_dir);
-        if let Err(err) = copy_dir_contents(&source_root, &destination) {
-            let _ = fs::remove_dir_all(&destination);
-            self.set_status(
-                StatusKind::Error,
-                format!("Install failed while copying files: {}", err),
-            );
-            self.pending_install = Some(pending);
-            return;
-        }
-
-        if let Err(err) = write_metadata_file(
-            &destination,
-            pending.mod_type,
-            pending.bike_category,
-            &pending.version,
-            &pending.notes,
-            &pending.archive_path,
-        ) {
-            self.set_status(
-                StatusKind::Info,
-                format!(
-                    "Installed, but failed to write metadata file in {}: {}",
-                    destination.display(),
-                    err
-                ),
-            );
-        } else {
-            self.set_status(
-                StatusKind::Success,
-                format!("Installed mod to {}", destination.display()),
-            );
-        }
-
-        let _ = fs::remove_dir_all(&pending.temp_extract_dir);
+        pending.source.cleanup();
         self.refresh_mod_lists();
     }
 
@@ -330,17 +613,31 @@ impl MxbmmApp {
             let pending = self.pending_install.as_mut().expect("checked above");
             ui.separator();
             ui.heading("Pending Install");
-            ui.label(format!("Archive: {}", pending.archive_path.display()));
+            ui.label(format!("File: {}", pending.source.input_path().display()));
 
-            egui::ComboBox::from_label("Mod type")
-                .selected_text(match pending.mod_type {
-                    ModType::Track => "Track",
-                    ModType::Bike => "Bike",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut pending.mod_type, ModType::Track, "Track");
-                    ui.selectable_value(&mut pending.mod_type, ModType::Bike, "Bike");
-                });
+            if let Some(forced) = pending.source.forced_mod_type() {
+                ui.label(format!(
+                    "Mod type: {} (auto)",
+                    match forced {
+                        ModType::Track => "Track",
+                        ModType::Bike => "Bike",
+                        ModType::Rider => "Rider",
+                    }
+                ));
+                pending.mod_type = forced;
+            } else {
+                egui::ComboBox::from_label("Mod type")
+                    .selected_text(match pending.mod_type {
+                        ModType::Track => "Track",
+                        ModType::Bike => "Bike",
+                        ModType::Rider => "Rider",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pending.mod_type, ModType::Track, "Track");
+                        ui.selectable_value(&mut pending.mod_type, ModType::Bike, "Bike");
+                        ui.selectable_value(&mut pending.mod_type, ModType::Rider, "Rider");
+                    });
+            }
 
             if pending.mod_type == ModType::Bike {
                 egui::ComboBox::from_label("Bike category")
@@ -388,7 +685,7 @@ impl MxbmmApp {
 
         if clicked_cancel {
             if let Some(pending) = self.pending_install.take() {
-                let _ = fs::remove_dir_all(&pending.temp_extract_dir);
+                pending.source.cleanup();
             }
             self.set_status(StatusKind::Info, "Pending install canceled.");
         }
@@ -403,6 +700,7 @@ impl MxbmmApp {
 
         let mut uninstall_target = None;
         egui::ScrollArea::vertical()
+            .id_salt(format!("mod_list_scroll_{}", title))
             .max_height(180.0)
             .show(ui, |ui| {
                 for entry in mods {
@@ -420,17 +718,19 @@ impl MxbmmApp {
 
 impl eframe::App for MxbmmApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync_fs_watcher();
+        self.process_fs_events();
         self.handle_dropped_files(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("MX Bikes Mod Manager");
-            ui.label("Drag and drop a .zip archive to begin installing a mod.");
+            ui.label("Drag and drop a .zip archive, .pkz file, or .pnt file to install.");
 
             let hovered_files = ctx.input(|i| i.raw.hovered_files.clone());
             if !hovered_files.is_empty() {
                 ui.colored_label(
                     egui::Color32::LIGHT_YELLOW,
-                    "Drop archive now to extract and configure install details.",
+                    "Drop file now to configure install details.",
                 );
             }
 
@@ -440,6 +740,7 @@ impl eframe::App for MxbmmApp {
                 ui.text_edit_singleline(&mut self.mods_root_input);
                 if ui.button("Refresh").clicked() {
                     self.refresh_mod_lists();
+                    self.sync_fs_watcher();
                     self.set_status(StatusKind::Info, "Refreshed installed mod list.");
                 }
             });
@@ -449,16 +750,18 @@ impl eframe::App for MxbmmApp {
 
             ui.separator();
             ui.heading("Installed Mods");
-            ui.columns(3, |cols| {
+            ui.columns(4, |cols| {
                 let tracks_uninstall = Self::draw_mod_list(&mut cols[0], "Tracks", &self.tracks);
                 let mx_uninstall =
                     Self::draw_mod_list(&mut cols[1], "Bikes (Motocross)", &self.bikes_motocross);
                 let sx_uninstall =
                     Self::draw_mod_list(&mut cols[2], "Bikes (Supercross)", &self.bikes_supercross);
+                let riders_uninstall = Self::draw_mod_list(&mut cols[3], "Riders", &self.riders);
 
                 self.pending_uninstall = tracks_uninstall
                     .or(mx_uninstall)
                     .or(sx_uninstall)
+                    .or(riders_uninstall)
                     .or(self.pending_uninstall.clone());
             });
         });
@@ -512,6 +815,9 @@ fn read_mod_entries(dir: &Path) -> Vec<ModEntry> {
 
     for item in read_dir.flatten() {
         let path = item.path();
+        if !path.is_dir() && !is_pkz_file(&path) && !is_pnt_file(&path) {
+            continue;
+        }
         let name = item.file_name().to_string_lossy().to_string();
         entries.push(ModEntry { name, path });
     }
@@ -525,6 +831,28 @@ fn is_supported_archive(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("zip"))
         .unwrap_or(false)
+}
+
+fn is_pkz_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("pkz"))
+        .unwrap_or(false)
+}
+
+fn is_pnt_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("pnt"))
+        .unwrap_or(false)
+}
+
+fn with_extension_if_missing(name: &str, extension: &str) -> String {
+    if name.to_lowercase().ends_with(extension) {
+        name.to_string()
+    } else {
+        format!("{name}{extension}")
+    }
 }
 
 fn extract_zip_archive(archive_path: &Path, destination: &Path) -> io::Result<()> {
@@ -635,6 +963,7 @@ fn write_metadata_file(
         match mod_type {
             ModType::Track => "track",
             ModType::Bike => "bike",
+            ModType::Rider => "rider",
         }
     )?;
     writeln!(file, "bike_category={}", bike_category.folder_name())?;
@@ -668,41 +997,25 @@ fn create_temp_extract_dir() -> io::Result<PathBuf> {
     ))
 }
 
-fn main() -> eframe::Result<()> {
-    configure_wgpu_backend_env();
+fn create_fs_watcher(root: &Path) -> notify::Result<FsWatcherState> {
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
 
-    match run_with_renderer(eframe::Renderer::Wgpu) {
-        Ok(()) => Ok(()),
-        Err(wgpu_err) => {
-            eprintln!("WGPU startup failed: {wgpu_err}");
-            eprintln!("Falling back to OpenGL renderer...");
-
-            match run_with_renderer(eframe::Renderer::Glow) {
-                Ok(()) => Ok(()),
-                Err(glow_err) => {
-                    eprintln!("OpenGL startup failed: {glow_err}");
-                    Err(glow_err)
-                }
-            }
-        }
-    }
+    Ok(FsWatcherState {
+        root: root.to_path_buf(),
+        _watcher: watcher,
+        rx,
+    })
 }
 
-fn run_with_renderer(renderer: eframe::Renderer) -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        renderer,
-        ..Default::default()
-    };
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions::default();
     eframe::run_native(
         "MX Bikes Mod Manager",
         options,
         Box::new(|_cc| Ok(Box::new(MxbmmApp::default()))),
     )
-}
-
-fn configure_wgpu_backend_env() {
-    if std::env::var_os("WGPU_BACKEND").is_none() {
-        // Some Windows VMs only expose DX11 adapters.
-        std::env::set_var("WGPU_BACKEND", "dx12,dx11,vulkan,metal,gl");
-    }
 }
