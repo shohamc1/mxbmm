@@ -20,6 +20,7 @@ pub struct MxbmmApp {
     mod_lists: HashMap<InstallTarget, Vec<ModEntry>>,
     pending_install: Option<PendingInstall>,
     pending_uninstall: Option<ModEntry>,
+    last_install_target: InstallTarget,
     fs_watcher: Option<FsWatcherState>,
     watcher_error_for_root: Option<PathBuf>,
 }
@@ -33,6 +34,7 @@ impl Default for MxbmmApp {
             mod_lists: HashMap::new(),
             pending_install: None,
             pending_uninstall: None,
+            last_install_target: InstallTarget::Tracks,
             fs_watcher: None,
             watcher_error_for_root: None,
         };
@@ -162,7 +164,7 @@ impl MxbmmApp {
         if is_pkz_file(&file_path) {
             match self.prepare_pending_single_file_install(
                 file_path.clone(),
-                InstallTarget::Tracks,
+                self.last_install_target,
                 "track",
                 |p| PendingSource::Pkz { pkz_path: p },
             ) {
@@ -193,7 +195,7 @@ impl MxbmmApp {
         if is_pnt_file(&file_path) {
             match self.prepare_pending_single_file_install(
                 file_path.clone(),
-                InstallTarget::RiderPaints,
+                self.last_install_target,
                 "rider",
                 |p| PendingSource::Pnt { pnt_path: p },
             ) {
@@ -265,7 +267,7 @@ impl MxbmmApp {
                 archive_path,
                 temp_extract_dir,
             },
-            install_target: InstallTarget::Tracks,
+            install_target: self.last_install_target,
             custom_name: default_name,
             notes: String::new(),
             version: String::new(),
@@ -469,8 +471,7 @@ impl MxbmmApp {
 
         let mut clicked_install = false;
         let mut clicked_cancel = false;
-
-        {
+        let selected_target = {
             let pending = self.pending_install.as_mut().expect("checked above");
             ui.separator();
             ui.heading("Pending Install");
@@ -502,7 +503,10 @@ impl MxbmmApp {
                     clicked_cancel = true;
                 }
             });
-        }
+            pending.install_target
+        };
+
+        self.last_install_target = selected_target;
 
         if clicked_install {
             self.install_pending();
